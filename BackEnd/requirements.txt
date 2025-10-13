@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+transformers
+torch
+jieba
+python-multipart
+accelerate
