@@ -26,43 +26,43 @@ class QwenScorer:
         }
 
         prompt = f"""
-作为中文作文评分专家，请根据以下HSK {hsk_level}评分标准评估这篇作文：
-{rubric[hsk_level]}
-1. 语法准确性（的/得/地、词序、助词）
-2. 词汇水平（HSK{hsk_level}词汇覆盖率）
-3. 连贯性（逻辑连接词、段落衔接）
-4. 文化适应性（印尼学习者常见错误：S-P-O-K干扰、false friends）
+        作为中文作文评分专家，请根据以下HSK {hsk_level}评分标准评估这篇作文：
+        {rubric[hsk_level]}
+        1. 语法准确性（的/得/地、词序、助词）
+        2. 词汇水平（HSK{hsk_level}词汇覆盖率）
+        3. 连贯性（逻辑连接词、段落衔接）
+        4. 文化适应性（印尼学习者常见错误：S-P-O-K干扰、false friends）
 
-【作文内容】
-{essay}
+        【作文内容】
+        {essay}
 
-请用严格有效的JSON格式输出，包含：
-- 总分（100分制）
-- 分项评分（grammar, vocabulary, coherence, cultural_adaptation）
-- 错误列表（type, position, correction, explanation）
-- 针对性反馈（针对印尼学习者的改进建议）
+        请用严格有效的JSON格式输出，包含：
+        - 总分（100分制）
+        - 分项评分（grammar, vocabulary, coherence, cultural_adaptation）
+        - 错误列表（type, position, correction, explanation）
+        - 针对性反馈（针对印尼学习者的改进建议）
 
-输出示例（仅JSON，无其他文字）：
-{{
-  "overall_score": 85,
-  "detailed_scores": {{
-    "grammar": 90,
-    "vocabulary": 80,
-    "coherence": 85,
-    "cultural_adaptation": 90
-  }},
-  "error_list": [
-    {{
-      "error_type": "word_order",
-      "error_position": [4, 6],
-      "incorrect_fragment": "吃饭在",
-      "suggested_correction": "在吃饭",
-      "explanation": "Struktur S-P-O-K dari Bahasa Indonesia salah. Gunakan S-K-P-O: '我在餐厅吃饭'."
-    }}
-  ],
-  "feedback": "Esai sudah baik, tapi perhatikan urutan kata dan partikel."
-}}
-"""
+        输出示例（仅JSON，无其他文字）：
+        {{
+        "overall_score": 85,
+        "detailed_scores": {{
+            "grammar": 90,
+            "vocabulary": 80,
+            "coherence": 85,
+            "cultural_adaptation": 90
+        }},
+        "error_list": [
+            {{
+            "error_type": "word_order",
+            "error_position": [4, 6],
+            "incorrect_fragment": "吃饭在",
+            "suggested_correction": "在吃饭",
+            "explanation": "Struktur S-P-O-K dari Bahasa Indonesia salah. Gunakan S-K-P-O: '我在餐厅吃饭'."
+            }}
+        ],
+        "feedback": "Esai sudah baik, tapi perhatikan urutan kata dan partikel."
+        }}
+        """
 
         try:
             response, _ = self.model.chat(self.tokenizer, prompt, history=None)
