@@ -2,12 +2,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import json # Tambahkan import json
-from model import QwenScorer # Pastikan path benar
+import json
+import logging
 
+# --- SETUP LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- IMPORT MODEL ---
+# 假设 QwenScorer 类在 backend/model.py 中
+from model import QwenScorer
+
+# --- FASTAPI APP SETUP ---
 app = FastAPI(title="AutoGrade-X: Mandarin Essay Scorer")
 
-# Tambahkan CORS middleware
+# Add CORS middleware to allow requests from the React frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # React dev server
@@ -16,86 +25,97 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- INITIALIZE MODEL ---
 scorer = QwenScorer()
 
+# --- REQUEST/RESPONSE MODEL ---
 class EssayRequest(BaseModel):
     text: str
     hsk_level: int
 
+# --- API ENDPOINT ---
 @app.post("/score")
 async def score_essay(req: EssayRequest):
+    """
+    Endpoint utama untuk menilai esai HSK.
+    """
+    logger.info(f"Received essay for HSK {req.hsk_level} (length: {len(req.text)} chars).")
+
+    # 1. Validasi input HSK level
     if req.hsk_level not in [1, 2, 3]:
         raise HTTPException(status_code=400, detail="HSK level must be 1, 2, or 3")
 
     try:
-        # Panggil model dan dapatkan string JSON
-        raw_json_string = scorer.generate_json(req.text, req.hsk_level)
-        print(f"Raw JSON string from model: {raw_json_string}") # Log untuk debugging
+        # 2. --- CALL THE LLM SCORING FUNCTION ---
+        # Ini memanggil metode `generate_json` di `model.py`
+        raw_json_string_from_model = scorer.generate_json(req.text, req.hsk_level)
+        logger.info(f"Raw JSON string from model (first 200 chars): {raw_json_string_from_model[:200]}...")
 
-        # Parse string JSON menjadi objek Python
-        parsed_data = json.loads(raw_json_string)
+        # 3. --- PARSE THE JSON STRING FROM THE MODEL ---
+        # Ubah string respons dari model menjadi objek Python
+        parsed_data_from_model = json.loads(raw_json_string_from_model)
+        logger.info(f"Parsed data from model: {parsed_data_from_model}")
 
-        # --- STANDARISASI KE SNAKE_CASE ---
-        # Ambil nilai dari data mentah, prioritaskan format snake_case, fallback ke title_case / format lain
-        overall_score = parsed_data.get("overall_score") or parsed_data.get("Overall_Score") or parsed_data.get("Overall Score") or 0
+        # 4. --- CHECK FOR MODEL ERROR OBJECT ---
+        # Jika model.py mengembalikan objek error, propagasikan sebagai HTTP 500 error
+        if isinstance(parsed_data_from_model, dict) and "error" in parsed_data_from_model:
+            logger.warning(f"Model returned an error object: {parsed_data_from_model}")
+            raise HTTPException(status_code=500, detail=f"LLM Processing Error: {parsed_data_from_model['error']}")
 
-        raw_detailed_scores = parsed_data.get("detailed_scores") or parsed_data.get("Detailed_Scores") or parsed_data.get("Detailed Scores") or {}
-        detailed_scores = {
-            "grammar": (
-                raw_detailed_scores.get("grammar") or
-                raw_detailed_scores.get("Grammar") or 0
-            ),
-            "vocabulary": (
-                raw_detailed_scores.get("vocabulary") or
-                raw_detailed_scores.get("Vocabulary") or 0
-            ),
-            "coherence": (
-                raw_detailed_scores.get("coherence") or
-                raw_detailed_scores.get("Coherence") or 0
-            ),
-            "cultural_adaptation": (
-                raw_detailed_scores.get("cultural_adaptation") or
-                raw_detailed_scores.get("Cultural_A Adaptation") or # Coba kunci yang bermasalah
-                raw_detailed_scores.get("Cultural Adaptation") or # Coba alternatif
-                raw_detailed_scores.get("Cultural_Adaptation") or # Coba alternatif lain
-                0
-            ),
+        # 5. --- FINAL VALIDATION & DEFAULTS ---
+        # Pastikan data yang di-parse adalah dictionary
+        if not isinstance(parsed_data_from_model, dict):
+            raise ValueError("Parsed JSON is not a dictionary/object.")
+
+        # Standarisasi kunci utama
+        standardized_result = {
+            "text": req.text, # Sertakan teks asli untuk highlighting di frontend
+            "overall_score": parsed_data_from_model.get("overall_score") or parsed_data_from_model.get("Overall Score") or parsed_data_from_model.get("Overall_Score") or 0,
+            "detailed_scores": {
+                "grammar": (
+                    (parsed_data_from_model.get("detailed_scores", {}) or {}).get("grammar") or
+                    (parsed_data_from_model.get("Detailed Scores", {}) or {}).get("Grammar") or
+                    (parsed_data_from_model.get("Detailed_Scores", {}) or {}).get("Grammar") or
+                    0
+                ),
+                "vocabulary": (
+                    (parsed_data_from_model.get("detailed_scores", {}) or {}).get("vocabulary") or
+                    (parsed_data_from_model.get("Detailed Scores", {}) or {}).get("Vocabulary") or
+                    (parsed_data_from_model.get("Detailed_Scores", {}) or {}).get("Vocabulary") or
+                    0
+                ),
+                "coherence": (
+                    (parsed_data_from_model.get("detailed_scores", {}) or {}).get("coherence") or
+                    (parsed_data_from_model.get("Detailed Scores", {}) or {}).get("Coherence") or
+                    (parsed_data_from_model.get("Detailed_Scores", {}) or {}).get("Coherence") or
+                    0
+                ),
+                "cultural_adaptation": (
+                    (parsed_data_from_model.get("detailed_scores", {}) or {}).get("cultural_adaptation") or
+                    (parsed_data_from_model.get("Detailed Scores", {}) or {}).get("Cultural Adaptation") or
+                    (parsed_data_from_model.get("Detailed_Scores", {}) or {}).get("Cultural_Adaptation") or # Handle potential underscore variant
+                    0
+                ),
+            },
+            "error_list": parsed_data_from_model.get("error_list") or parsed_data_from_model.get("Error List") or parsed_data_from_model.get("Error_List") or [],
+            "feedback": parsed_data_from_model.get("feedback") or parsed_data_from_model.get("Feedback") or "Tidak ada umpan balik.",
         }
 
-        # Standarisasi error list
-        raw_error_list = parsed_data.get("error_list") or parsed_data.get("Error List") or []
-        standardized_error_list = []
-        for raw_error in raw_error_list:
-             standardized_error = {
-                "error_type": raw_error.get("error_type") or raw_error.get("Error_Type") or raw_error.get("Error Type") or "Unknown",
-                "error_position": raw_error.get("error_position") or raw_error.get("Error_Position") or raw_error.get("Error Position") or [None, None],
-                "incorrect_fragment": raw_error.get("incorrect_fragment") or raw_error.get("Incorrect_Fragment") or raw_error.get("Incorrect Fragment") or "",
-                "suggested_correction": raw_error.get("suggested_correction") or raw_error.get("Suggested_Correction") or raw_error.get("Suggested Correction") or "",
-                "explanation": raw_error.get("explanation") or raw_error.get("Explanation") or "No explanation provided.",
-            }
-             standardized_error_list.append(standardized_error)
+        logger.info(f"Final standardized result to send: {standardized_result}")
 
-        feedback = parsed_data.get("feedback") or parsed_data.get("Feedback") or "Tidak ada umpan balik."
-
-        # Buat objek hasil final dalam format snake_case
-        final_result = {
-            "text": req.text, # Sertakan teks asli
-            "overall_score": overall_score,
-            "detailed_scores": detailed_scores,
-            "error_list": standardized_error_list,
-            "feedback": feedback,
-        }
-
-        print(f"Final result to send (SNAKE_CASE): {final_result}") # Log final result sebelum dikirim
-
-        return final_result # Kembalikan hasil yang sudah distandarisasi
+        # 6. --- RETURN THE STANDARDIZED RESULT ---
+        # FastAPI akan secara otomatis mengkonversi dictionary ini ke JSON dan mengirimkannya sebagai respons HTTP.
+        return standardized_result
 
     except json.JSONDecodeError as e:
-        print(f"JSON Decode Error: {e}")
-        print(f"Raw output was: {raw_json_string}")
+        # Tangani error jika model.py mengembalikan string yang bukan JSON yang valid
+        logger.error(f"JSON Decode Error: {e}")
+        logger.error(f"Raw output was: {raw_json_string_from_model}")
         raise HTTPException(status_code=500, detail=f"Backend error: Invalid JSON from LLM. {str(e)}")
+    except HTTPException:
+        # Re-raise HTTPExceptions (seperti yang dari model error check di atas)
+        raise
     except Exception as e:
-        print(f"General Error in /score: {e}")
-        import traceback
-        traceback.print_exc() # Cetak stack trace penuh untuk debugging
+        # Tangani error tak terduga lainnya selama proses penilaian
+        logger.exception(f"General Error in /score: {e}")
         raise HTTPException(status_code=500, detail=f"Scoring failed: {str(e)}")
