@@ -259,44 +259,47 @@ Now analyze the essay and return the JSON object exactly.
                 return False, None
         return False, None
 
-    def generate_json_from_llm_output(raw_output: str):
-            try:
-                data = json.loads(raw_output)
-                return data
-            except Exception:
-                logging.warning("Initial JSON parse failed; trying cleanup.")
+    def generate_json_from_llm_output(self, raw_output: str) -> Dict[str, Any]:
+        """Robustly parse LLM output into a Python dict.
+        Tries direct json.loads, cleaned substring, and regex/score extraction fallbacks.
+        """
+        if raw_output is None:
+            return {"error": "No output from LLM.", "raw_response": ""}
+        # 1) direct parse
+        try:
+            return json.loads(raw_output)
+        except Exception:
+            logger.warning("Initial JSON parse failed; trying cleanup.")
+        # 2) trim non-json prefix/suffix then parse
+        try:
+            cleaned = re.sub(r'^[^{\[]*', '', raw_output)
+            cleaned = re.sub(r'[^}\]]*$', '', cleaned)
+            return json.loads(cleaned)
+        except Exception:
+            logger.debug("Cleanup parse failed; trying regex/score extraction.")
+        # 3) fallback: try to extract key:value numeric pairs and return a minimal structure
+        try:
+            scores = re.findall(r'(\b[\w ]+\b):\s*(\d{1,3})', raw_output)
+            data = {
+                "overall_score": None,
+                "detailed_scores": {},
+                "error_list": [],
+                "feedback": raw_output.strip()
+            }
+            for k, v in scores:
+                key = k.lower().strip().replace(" ", "_")
                 try:
-                    import re
-                    cleaned = re.sub(r'^[^{\[]*', '', raw_output)
-                    cleaned = re.sub(r'[^}\]]*$', '', cleaned)
-                    data = json.loads(cleaned)
-                    return data
+                    val = int(v)
                 except Exception:
-                    logging.error("Failed to parse JSON after cleanup.")
-                    # fallback mode
-                    if isinstance(raw_output, str):
-                        # coba ekstrak skor dari teks biasa
-                        import re
-                        scores = re.findall(r'(\b\w+\b):\s*(\d+)', raw_output)
-                        data = {
-                            "overall_score": 0,
-                            "detailed_scores": {},
-                            "error_list": [],
-                            "feedback": raw_output.strip()
-                        }
-                        for k, v in scores:
-                            key = k.lower().replace(" ", "_")
-                            try:
-                                val = int(v)
-                                data["detailed_scores"][key] = val
-                                if key in ["overall_score", "overall"]:
-                                    data["overall_score"] = val
-                            except:
-                                pass
-                        return data
-
-                    # kalau bukan string, convert paksa ke str biar aman
-                    return {"error": "Failed to parse JSON from LLM output.", "raw_response": str(raw_output)}
+                    continue
+                if key in ("overall", "overall_score"):
+                    data["overall_score"] = val
+                else:
+                    data["detailed_scores"][key] = val
+            return data
+        except Exception:
+            logger.exception("All parsing fallbacks failed.")
+            return {"error": "Failed to parse JSON from LLM output.", "raw_response": str(raw_output)}
 
 
     # ---------------- Main: generate_json ----------------
@@ -332,51 +335,33 @@ Now analyze the essay and return the JSON object exactly.
         # extract JSON block
         json_block = extract_json_block(resp)
         if json_block is None:
-            logger.error("No JSON found in model response.")
-            return json.dumps({"error": "No JSON block found in model response.", "raw_response": resp}, ensure_ascii=False)
+            logger.warning("No JSON block found; will attempt full-response parsing.")
+            parsed = self.generate_json_from_llm_output(resp)
+        else:
+            parsed = safe_json_load(json_block)
+            if parsed is None:
+                # try more robust helper
+                parsed = self.generate_json_from_llm_output(json_block)
 
-        # try parsing raw block and fallback cleaning
-        parsed = safe_json_load(json_block)
+        # Ensure parsed is a dict
+        if not isinstance(parsed, dict):
+            logger.error("Parsed LLM output is not a dict; returning error.")
+            return json.dumps({"error": "Parsed LLM output is not a dict.", "raw_response": resp}, ensure_ascii=False)
 
-        
-        # --- tambahkan mulai di sini ---
-        standardized = {
+        # start building standardized structure
+        standardized: Dict[str, Any] = {
             "text": parsed.get("text", essay),
-            "overall_score": parsed.get("overall_score") or parsed.get("score", {}).get("overall"),
-            "detailed_scores": parsed.get("detailed_scores") or parsed.get("score", {}),
-            "error_list": parsed.get("error_list", []),
-            "feedback": parsed.get("feedback", "")
-        }
-
-        # kalau skor <100 tapi error_list kosong → buat dummy error list
-        if (standardized["overall_score"] is not None and standardized["overall_score"] < 100) and not standardized["error_list"]:
-            import jieba.posseg as pseg
-            words = list(pseg.cut(essay))
-            standardized["error_list"] = [{
-                "error_type": "potential_error",
-                "error_position": [i, i+1],
-                "incorrect_fragment": w.word,
-                "suggested_correction": w.word,
-                "explanation": "Potential issue detected automatically — please verify grammar or word order."
-            } for i, w in enumerate(words[:3])]
-
-        return json.dumps(standardized, ensure_ascii=False)
-
-
-        # STANDARDIZE output to frontend format
-        standardized = {
-            "text": essay,
-            "overall_score": 0,
+            "overall_score": None,
             "detailed_scores": {"grammar": 0, "vocabulary": 0, "coherence": 0, "cultural_adaptation": 0},
             "error_list": [],
-            "feedback": ""
+            "feedback": parsed.get("feedback", ""),
+            "processing_time": None
         }
 
         # ----- scores normalization -----
-        score_block = parsed.get("score") or parsed.get("scores") or parsed.get("score_breakdown") or {}
+        score_block = parsed.get("score") or parsed.get("scores") or parsed.get("score_breakdown") or parsed.get("detailed_scores") or {}
         try:
             if isinstance(score_block, dict):
-                # accept sub-scores provided 0-25 (HSK instruction) or 0-100
                 def parse_sub(k_list, default=0):
                     for k in k_list:
                         if k in score_block:
@@ -392,7 +377,7 @@ Now analyze the essay and return the JSON object exactly.
                 g_raw = parse_sub(["grammar", "Grammar"], 0)
                 v_raw = parse_sub(["vocabulary", "Vocabulary"], 0)
                 c_raw = parse_sub(["coherence", "Coherence"], 0)
-                ca_raw = parse_sub(["cultural_adaptation", "Cultural Adaptation"], 0)
+                ca_raw = parse_sub(["cultural_adaptation", "cultural_adaptation", "Cultural Adaptation"], 0)
 
                 def normalize_sub(x):
                     if x <= 25:
@@ -412,27 +397,26 @@ Now analyze the essay and return the JSON object exactly.
                     "cultural_adaptation": cultural_s
                 }
 
-                # prefer explicit overall if present
-                overall_raw = score_block.get("overall") or score_block.get("Overall")
+                # compute overall as rubric-weighted average unless explicit overall provided
+                overall_raw = None
+                # check multiple possible keys
+                if "overall" in score_block:
+                    overall_raw = score_block.get("overall")
+                elif "overall_score" in score_block:
+                    overall_raw = score_block.get("overall_score")
+
                 if overall_raw is not None:
                     try:
-                        overall_given = int(overall_raw)
-                        standardized["overall_score"] = max(0, min(100, overall_given))
+                        standardized["overall_score"] = int(overall_raw)
                     except Exception:
-                        # fallback compute weighted overall
-                        calc = int(round(
-                            grammar_s * self.rubric_weights["grammar"] +
-                            vocab_s * self.rubric_weights["vocabulary"] +
-                            coherence_s * self.rubric_weights["coherence"] +
-                            cultural_s * self.rubric_weights["task_completion"]
-                        ))
-                        standardized["overall_score"] = max(0, min(100, calc))
+                        standardized["overall_score"] = None
                 else:
+                    # weighted compute
                     calc = int(round(
-                        grammar_s * self.rubric_weights["grammar"] +
-                        vocab_s * self.rubric_weights["vocabulary"] +
-                        coherence_s * self.rubric_weights["coherence"] +
-                        cultural_s * self.rubric_weights["task_completion"]
+                        grammar_s * self.rubric_weights.get("grammar", 0.25) +
+                        vocab_s * self.rubric_weights.get("vocabulary", 0.25) +
+                        coherence_s * self.rubric_weights.get("coherence", 0.25) +
+                        cultural_s * self.rubric_weights.get("cultural_adaptation", 0.25)
                     ))
                     standardized["overall_score"] = max(0, min(100, calc))
             else:
@@ -446,27 +430,20 @@ Now analyze the essay and return the JSON object exactly.
         except Exception:
             logger.exception("Error normalizing scores; setting defaults.")
 
-        
-        parsed = safe_json_load(json_block)
-
-
-
         # ----- errors extraction & strict validation -----
         errors_block = parsed.get("errors") or parsed.get("error_list") or parsed.get("Error List") or []
-        validated_errors = []
+        validated_errors: List[Dict[str, Any]] = []
         if isinstance(errors_block, list):
             for idx, item in enumerate(errors_block):
                 if not isinstance(item, dict):
                     logger.warning("Skipping non-dict error item at index %d", idx)
                     continue
-                # try many possible key variants
-                etype = item.get("type") or item.get("error_type") or item.get("errorType") or item.get("error_type", "unknown")
-                pos = item.get("position") or item.get("error_position") or item.get("pos") or item.get("position", [])
+                etype = item.get("type") or item.get("error_type") or item.get("errorType") or "unknown"
+                pos = item.get("position") or item.get("error_position") or item.get("pos") or []
                 incorrect_fragment = item.get("incorrect_fragment") or item.get("incorrect") or item.get("incorrect_fragment", "")
                 correction = item.get("correction") or item.get("suggested_correction") or item.get("correction", "")
                 explanation = item.get("explanation") or item.get("explain") or item.get("explanation", "")
 
-                # validate pos
                 if not isinstance(pos, list) or len(pos) != 2:
                     logger.warning("Invalid position for error idx %s: %s", idx, pos)
                     continue
@@ -494,11 +471,26 @@ Now analyze the essay and return the JSON object exactly.
 
         standardized["error_list"] = validated_errors
 
+        # if no errors but overall < 100, add conservative potential_error items
+        if not standardized["error_list"] and isinstance(standardized.get("overall_score"), int) and standardized["overall_score"] < 100:
+            try:
+                words = list(pseg.cut(essay))
+                pe = []
+                for i, w in enumerate(words[:3]):
+                    pe.append({
+                        "error_type": "potential_error",
+                        "error_position": [i, i+1],
+                        "incorrect_fragment": w.word,
+                        "suggested_correction": w.word,
+                        "explanation": "Potential issue detected automatically; please verify."
+                    })
+                standardized["error_list"] = pe
+            except Exception:
+                logger.debug("Failed to generate potential_error fallback.")
+
         # ----- feedback extraction -----
         fb = parsed.get("feedback") or parsed.get("Feedback") or parsed.get("comments") or ""
-        # make sure feedback exists; if it's missing or empty, inject a minimal friendly feedback
         if not fb:
-            # Attempt to auto-generate a tiny fallback feedback based on scores
             gs = standardized["detailed_scores"]["grammar"]
             vs = standardized["detailed_scores"]["vocabulary"]
             cs = standardized["detailed_scores"]["coherence"]
@@ -506,19 +498,19 @@ Now analyze the essay and return the JSON object exactly.
             english_fb = f"Overall score: {standardized['overall_score']}. Grammar: {gs}/100; Vocabulary: {vs}/100; Coherence: {cs}/100. Focus on common Indonesian learner issues: word order and particles."
             ind_fb = "(Secara umum, perhatikan urutan kata dan penggunaan partikel.)"
             fb = f"{english_fb} {ind_fb}"
-        # If feedback is a dict with bilingual parts, accept it; otherwise convert to string
         if isinstance(fb, dict):
-            # join english and indonesian if present
             e = fb.get("english") or fb.get("en") or ""
             i = fb.get("indonesian") or fb.get("id") or fb.get("indonesia") or ""
             if not e:
                 e = fb.get("text") or ""
             fb = f"{e} ({i})" if i else e
         else:
-            # ensure string
             fb = str(fb)
 
         standardized["feedback"] = fb
+
+        # processing time was not measured because we didn't record start; add None or "0.00 detik"
+        standardized["processing_time"] = parsed.get("processing_time") or "0.00 detik"
 
         # ----- final type sanitation -----
         try:
@@ -537,34 +529,9 @@ Now analyze the essay and return the JSON object exactly.
         if not isinstance(standardized.get("error_list"), list):
             standardized["error_list"] = []
 
-        # return JSON preserving Hanzi
         try:
             return json.dumps(standardized, ensure_ascii=False)
         except Exception as e:
             logger.exception("Failed to dump final standardized JSON.")
             return json.dumps({"error": f"Failed to build final JSON: {repr(e)}", "raw_parsed": parsed}, ensure_ascii=False)
-
-
-
-# ---------------- Example embedding helper placeholder ----------------
-# If you want to enable embeddings for false-friend detection, implement:
-# def get_embedding(word: str) -> List[float]:
-#     # e.g. use FastText or sentence-transformer
-#     ...
-# and instantiate QwenScorer(use_embeddings_for_false_friends=True, embedding_get_vec_fn=get_embedding)
-
-# ---------------- Quick local test (only if run directly) ----------------
-if __name__ == "__main__":
-    test_essay = "上个星期六，我和朋友去公园玩。我们早上九点起床。我吃早饭，然后穿衣服。朋友开车带我们去公园。公园里有很多人。我们放风筝，吃午饭，然后回家。我玩得很开心。"
-    try:
-        scorer = QwenScorer()
-        result = scorer.generate_json(test_essay, hsk_level=2)
-        print(result)
-    except Exception as e:
-        logger.error("Local run failed: %s", e)
-
-
-
-
-
 
