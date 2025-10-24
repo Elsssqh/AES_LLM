@@ -1,4 +1,6 @@
 version.txt
+
+SEBELUM 23-10-25
 # # Qwen-1.8B-Chat based HSK Essay Scorer (complete)
 # # - Jieba preprocessing (segmentation + POS tagging)
 # # - Prompt engineering (few-shot + strict JSON output)
@@ -518,3 +520,503 @@ version.txt
 # - Optional embedding-based false-friend helper (pluggable)
 # - Robust JSON extraction, parsing and sanitization
 # - Final standardized JSON output expected by frontend
+
+
+
+
+# from transformers import AutoModelForCausalLM, AutoTokenizer
+# import json
+# import re
+# import logging
+# from typing import List, Tuple, Dict, Optional, Any
+# import math
+# import jieba
+# import jieba.posseg as pseg
+
+# # ---------------- Logger ----------------
+# logger = logging.getLogger(__name__)
+# logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+
+# # ---------------- Helpers ----------------
+# def safe_json_load(s: str) -> Optional[Dict[str, Any]]:
+#     """Attempt to load JSON robustly; try small cleanups if necessary."""
+#     try:
+#         return json.loads(s)
+#     except Exception:
+#         # remove trailing commas in objects/arrays
+#         try:
+#             s2 = re.sub(r',\s*([}\]])', r'\1', s)
+#             return json.loads(s2)
+#         except Exception:
+#             return None
+
+# def extract_json_block(text: str) -> Optional[str]:
+#     """
+#     Extract first balanced JSON object from text (scans braces).
+#     Fallbacks to regex.
+#     """
+#     if not isinstance(text, str):
+#         return None
+#     text = text.strip()
+#     start = None
+#     depth = 0
+#     for i, ch in enumerate(text):
+#         if ch == '{':
+#             if start is None:
+#                 start = i
+#             depth += 1
+#         elif ch == '}':
+#             depth -= 1
+#             if depth == 0 and start is not None:
+#                 return text[start:i+1]
+#     # fallback regex
+#     m = re.search(r'\{(?:.|\s)*\}', text)
+#     return m.group(0) if m else None
+
+# def cosine_similarity(v1: List[float], v2: List[float]) -> float:
+#     """Basic cosine similarity for two equal-dim vectors."""
+#     if not v1 or not v2 or len(v1) != len(v2):
+#         return 0.0
+#     dot = sum(a*b for a,b in zip(v1, v2))
+#     n1 = math.sqrt(sum(a*a for a in v1))
+#     n2 = math.sqrt(sum(b*b for b in v2))
+#     if n1 == 0 or n2 == 0:
+#         return 0.0
+#     return dot / (n1 * n2)
+
+# # ---------------- QwenScorer ----------------
+# class QwenScorer:
+#     """
+#     Wrapper for Qwen-1.8B-Chat to score HSK essays.
+#     """
+
+#     def __init__(self,
+#                  model_name: str = "Qwen/Qwen-1_8B-Chat",
+#                  use_embeddings_for_false_friends: bool = False,
+#                  embedding_get_vec_fn: Optional[callable] = None):
+#         """
+#         model_name: HF model id (default Qwen/Qwen-1_8B-Chat)
+#         use_embeddings_for_false_friends: enable embedding checks (optional)
+#         embedding_get_vec_fn: function(word)->vector
+#         """
+#         logger.info("Initializing QwenScorer (model=%s)...", model_name)
+#         try:
+#             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+#             logger.info("Tokenizer loaded.")
+#             self.model = AutoModelForCausalLM.from_pretrained(
+#                 model_name,
+#                 device_map="auto",
+#                 trust_remote_code=True,
+#                 torch_dtype="auto"
+#             ).eval()
+#             logger.info("Model loaded and set to eval mode.")
+#         except Exception as e:
+#             logger.exception("Failed to load model/tokenizer.")
+#             raise
+
+#         # initialize jieba
+#         try:
+#             jieba.initialize()
+#         except Exception:
+#             pass
+
+#         # flags / helpers for false friend detection
+#         self.use_embeddings_for_false_friends = use_embeddings_for_false_friends
+#         self.embedding_get_vec_fn = embedding_get_vec_fn
+
+#         # rubric weights for computing overall if not provided
+#         self.rubric_weights = {
+#             "grammar": 0.30,
+#             "vocabulary": 0.30,
+#             "coherence": 0.20,
+#             "cultural_adaptation": 0.20
+#         }
+
+#         # small curated false-friend examples (expandable)
+#         self.false_friend_examples = [
+#             ("路忙", "路很拥挤"),
+#             ("我妹妹是十岁", "我妹妹十岁"),
+#         ]
+
+#     # ---------------- Preprocess ----------------
+#     def _preprocess_with_jieba(self, essay: str) -> Tuple[str, str]:
+#         """Run jieba segmentation and POS tagging; return (segmented, pos_lines)."""
+#         try:
+#             words = list(pseg.cut(essay))
+#             segmented = " ".join([w for w, _ in words])
+#             pos_lines = "\n".join([f"{w}: {flag}" for w, flag in words])
+#             return segmented, pos_lines
+#         except Exception as e:
+#             logger.exception("Jieba preprocessing failed.")
+#             return essay, "Jieba preprocessing failed."
+
+#     # ---------------- Prompt building (with few-shot & strict JSON) ----------------
+#     def _build_prompt(self, essay: str, segmented: str, pos_tags: str, hsk_level: int) -> str:
+#         """
+#         Build a carefully tuned prompt. Use placeholders replaced with .replace to avoid
+#         .format brace collisions.
+#         """
+
+#         rubric_map = {
+#             1: "HSK 1: very short texts; S-P or S-P-O basic structures.",
+#             2: "HSK 2: 20–40 characters; use simple connectors like 在, 和.",
+#             3: "HSK 3: 50–100 characters; use 的/得/地 and compound sentences."
+#         }
+#         rubric_desc = rubric_map.get(hsk_level, rubric_map[1])
+
+#         # Few-shot examples to encourage consistent feedback and JSON fields.
+#         # NOTE: use double-quoted JSON examples but don't use Python .format on them.
+#         FEW_SHOT = r"""
+# ### Example 1
+# Input: 我妹妹是十岁。
+# Output JSON:
+# {
+#   "score": {"overall": 60, "grammar": 15, "vocabulary": 15, "coherence": 15, "cultural_adaptation": 15},
+#   "errors": [
+#     {
+#       "type": "particle_misuse",
+#       "position": [0, 6],
+#       "incorrect_fragment": "我妹妹是十岁",
+#       "correction": "我妹妹十岁",
+#       "explanation": "Unnecessary '是' before age in Mandarin. (Partikel '是' tidak digunakan sebelum umur.)"
+#     }
+#   ],
+#   "feedback": "Avoid using '是' before ages; try '我妹妹十岁'. (Hindari menggunakan '是' sebelum menyatakan umur.)"
+# }
+
+# ### Example 2
+# Input: 路很忙。
+# Output JSON:
+# {
+#   "score": {"overall": 50, "grammar": 10, "vocabulary": 15, "coherence": 15, "cultural_adaptation": 10},
+#   "errors": [
+#     {
+#       "type": "word_choice",
+#       "position": [0, 3],
+#       "incorrect_fragment": "路很忙",
+#       "correction": "路很拥挤",
+#       "explanation": "'忙' is not used to describe roads; use 拥挤. (Kata '忙' tidak tepat untuk jalan.)"
+#     }
+#   ],
+#   "feedback": "Use appropriate collocations: '路很拥挤' instead of '路很忙'. (Gunakan kolokasi yang tepat.)"
+# }
+# """
+
+#         PROMPT = """
+# You are an expert HSK writing examiner and Chinese-as-a-foreign-language teacher.
+# Task: Evaluate the following Mandarin essay written by an Indonesian learner and return EXACTLY ONE VALID JSON OBJECT (no extra text).
+
+# Important:
+# - Return JSON only.
+# - Include bilingual feedback (English sentence(s) followed by short Bahasa Indonesia in parentheses).
+# - Use 0-based character indices for "position": [start_inclusive, end_exclusive].
+# - Subscores grammar/vocabulary/coherence/cultural_adaptation should be 0–25 (integers).
+# - overall should be 0–100 (integer).
+# - If no errors of a given kind, return empty errors array [].
+
+# FEW-SHOT EXAMPLES:
+# <Few_Shot_Examples>
+
+# ESSAY (ANALYZE ONLY THE TEXT BELOW):
+# <ESSAY>
+
+# JIEBA SEGMENTATION:
+# <SEGMENTATION>
+
+# POS TAGS:
+# <POS_TAGS>
+
+# RUBRIC NOTE:
+# <RUBRIC>
+
+# RETURN JSON IN THIS EXACT SHAPE (EXACT KEYS):
+# {
+#   "score": {
+#     "overall": 0,
+#     "grammar": 0,
+#     "vocabulary": 0,
+#     "coherence": 0,
+#     "cultural_adaptation": 0
+#   },
+#   "errors": [
+#     {
+#       "type": "word_order",
+#       "position": [0, 0],
+#       "incorrect_fragment": "",
+#       "correction": "",
+#       "explanation": ""
+#     }
+#   ],
+#   "feedback": ""  // must be a short paragraph: 3-6 sentences in English + short Bahasa Indonesia in parentheses
+# }
+
+# Now analyze the essay and return the JSON object exactly.
+# """
+#         # assemble prompt by replacing placeholders (no {} for .format)
+#         prompt = PROMPT.replace("<Few_Shot_Examples>", FEW_SHOT)\
+#                        .replace("<ESSAY>", essay)\
+#                        .replace("<SEGMENTATION>", segmented)\
+#                        .replace("<POS_TAGS>", pos_tags)\
+#                        .replace("<RUBRIC>", rubric_desc)
+#         return prompt
+
+#     # ---------------- False-friend helper ----------------
+#     def detect_false_friends(self, token: str, context_tokens: List[str]) -> Tuple[bool, Optional[Tuple[str, float]]]:
+#         """
+#         Simple heuristic using curated list or embedding function if provided.
+#         Returns (is_false_friend, (suggested_replacement, score))
+#         """
+#         for wrong, correct in self.false_friend_examples:
+#             if wrong in token:
+#                 return True, (correct, 1.0)
+#         if self.use_embeddings_for_false_friends and self.embedding_get_vec_fn:
+#             try:
+#                 vec_t = self.embedding_get_vec_fn(token)
+#                 best = (None, -1.0)
+#                 for _, candidate in self.false_friend_examples:
+#                     vec_c = self.embedding_get_vec_fn(candidate)
+#                     sim = cosine_similarity(vec_t, vec_c)
+#                     if sim > best[1]:
+#                         best = (candidate, sim)
+#                 if best[0] and best[1] > 0.6:
+#                     return True, (best[0], best[1])
+#             except Exception:
+#                 return False, None
+#         return False, None
+
+#     def generate_json_from_llm_output(self, raw_output: str) -> Dict[str, Any]:
+#         """Robustly parse LLM output into a Python dict.
+#         Tries direct json.loads, cleaned substring, and regex/score extraction fallbacks.
+#         """
+#         if raw_output is None:
+#             return {"error": "No output from LLM.", "raw_response": ""}
+#         # 1) direct parse
+#         try:
+#             return json.loads(raw_output)
+#         except Exception:
+#             logger.warning("Initial JSON parse failed; trying cleanup.")
+#         # 2) trim non-json prefix/suffix then parse
+#         try:
+#             cleaned = re.sub(r'^[^{\[]*', '', raw_output)
+#             cleaned = re.sub(r'[^}\]]*$', '', cleaned)
+#             return json.loads(cleaned)
+#         except Exception:
+#             logger.debug("Cleanup parse failed; trying regex/score extraction.")
+#         # 3) fallback: try to extract key:value numeric pairs and return a minimal structure
+#         try:
+#             scores = re.findall(r'(\b[\w ]+\b):\s*(\d{1,3})', raw_output)
+#             data = {
+#                 "overall_score": None,
+#                 "detailed_scores": {},
+#                 "error_list": [],
+#                 "feedback": raw_output.strip()
+#             }
+#             for k, v in scores:
+#                 key = k.lower().strip().replace(" ", "_")
+#                 try:
+#                     val = int(v)
+#                 except Exception:
+#                     continue
+#                 if key in ("overall", "overall_score"):
+#                     data["overall_score"] = val
+#                 else:
+#                     data["detailed_scores"][key] = val
+#             return data
+#         except Exception:
+#             logger.exception("All parsing fallbacks failed.")
+#             return {"error": "Failed to parse JSON from LLM output.", "raw_response": str(raw_output)}
+
+
+#     # ---------------- Main: generate_json ----------------
+#     def generate_json(self, essay: str, hsk_level: int = 1) -> str:
+#         """
+#         Process essay -> build prompt -> call LLM -> parse & sanitize -> return standardized JSON.
+#         Final standardized keys:
+#           - text
+#           - overall_score (int 0-100)
+#           - detailed_scores: {grammar, vocabulary, coherence, cultural_adaptation} (ints 0-100)
+#           - error_list: list of {error_type, error_position, incorrect_fragment, suggested_correction, explanation}
+#           - feedback: bilingual string
+#         """
+#         logger.info("Generate JSON called (HSK %s) essay_length=%d", hsk_level, len(essay))
+#         segmented, pos_tags = self._preprocess_with_jieba(essay)
+#         logger.debug("Segmentation: %s", segmented)
+#         prompt = self._build_prompt(essay, segmented, pos_tags, hsk_level)
+
+#         # send to model
+#         try:
+#             logger.debug("Sending prompt to Qwen model (chat)...")
+#             response, _ = self.model.chat(self.tokenizer, prompt, history=None)
+#             logger.debug("Received response from model.")
+#         except Exception as e:
+#             logger.exception("LLM inference failed.")
+#             return json.dumps({"error": f"LLM inference failed: {repr(e)}", "raw_prompt": prompt[:1000]}, ensure_ascii=False)
+
+#         # sanitize response: remove code fences
+#         resp = str(response).strip()
+#         resp = re.sub(r'^\s*```(?:json)?\s*', '', resp)
+#         resp = re.sub(r'\s*```\s*$', '', resp).strip()
+
+#         # extract JSON block
+#         json_block = extract_json_block(resp)
+#         if json_block is None:
+#             logger.warning("No JSON block found; will attempt full-response parsing.")
+#             parsed = self.generate_json_from_llm_output(resp)
+#         else:
+#             parsed = safe_json_load(json_block)
+#             if parsed is None:
+#                 # try more robust helper
+#                 parsed = self.generate_json_from_llm_output(json_block)
+
+#         # Ensure parsed is a dict
+#         if not isinstance(parsed, dict):
+#             logger.error("Parsed LLM output is not a dict; returning error.")
+#             return json.dumps({"error": "Parsed LLM output is not a dict.", "raw_response": resp}, ensure_ascii=False)
+
+#         # start building standardized structure
+#         standardized: Dict[str, Any] = {
+#             "text": parsed.get("text", essay),
+#             "overall_score": None,
+#             "detailed_scores": {"grammar": 0, "vocabulary": 0, "coherence": 0, "cultural_adaptation": 0},
+#             "error_list": [],
+#             "feedback": parsed.get("feedback", ""),
+#             "processing_time": None
+#         }
+
+#         # ----- scores normalization -----
+#         score_block = parsed.get("score") or parsed.get("scores") or parsed.get("score_breakdown") or parsed.get("detailed_scores") or {}
+#         try:
+#             if isinstance(score_block, dict):
+#                 def parse_sub(k_list, default=0):
+#                     for k in k_list:
+#                         if k in score_block:
+#                             try:
+#                                 return int(score_block[k])
+#                             except Exception:
+#                                 try:
+#                                     return int(float(score_block[k]))
+#                                 except Exception:
+#                                     return default
+#                     return default
+
+#                 g_raw = parse_sub(["grammar", "Grammar"], 0)
+#                 v_raw = parse_sub(["vocabulary", "Vocabulary"], 0)
+#                 c_raw = parse_sub(["coherence", "Coherence"], 0)
+#                 ca_raw = parse_sub(["cultural_adaptation", "cultural_adaptation", "Cultural Adaptation"], 0)
+
+#                 def normalize_sub(x):
+#                     if x <= 25:
+#                         return int(x * 4)
+#                     else:
+#                         return max(0, min(100, int(x)))
+
+#                 grammar_s = normalize_sub(g_raw)
+#                 vocab_s = normalize_sub(v_raw)
+#                 coherence_s = normalize_sub(c_raw)
+#                 cultural_s = normalize_sub(ca_raw)
+
+#                 standardized["detailed_scores"] = {
+#                     "grammar": grammar_s,
+#                     "vocabulary": vocab_s,
+#                     "coherence": coherence_s,
+#                     "cultural_adaptation": cultural_s
+#                 }
+
+#                 # compute overall as rubric-weighted average unless explicit overall provided
+#                 overall_raw = None
+#                 # check multiple possible keys
+#                 if "overall" in score_block:
+#                     overall_raw = score_block.get("overall")
+#                 elif "overall_score" in score_block:
+#                     overall_raw = score_block.get("overall_score")
+
+#                 if overall_raw is not None:
+#                     try:
+#                         standardized["overall_score"] = int(overall_raw)
+#                     except Exception:
+#                         standardized["overall_score"] = None
+#                 else:
+#                     # weighted compute
+#                     calc = int(round(
+#                         grammar_s * self.rubric_weights.get("grammar", 0.25) +
+#                         vocab_s * self.rubric_weights.get("vocabulary", 0.25) +
+#                         coherence_s * self.rubric_weights.get("coherence", 0.25) +
+#                         cultural_s * self.rubric_weights.get("cultural_adaptation", 0.25)
+#                     ))
+#                     standardized["overall_score"] = max(0, min(100, calc))
+#             else:
+#                 # maybe top-level overall present
+#                 o = parsed.get("overall") or parsed.get("overall_score") or parsed.get("Overall")
+#                 if o is not None:
+#                     try:
+#                         standardized["overall_score"] = int(o)
+#                     except Exception:
+#                         standardized["overall_score"] = 0
+#         except Exception:
+#             logger.exception("Error normalizing scores; setting defaults.")
+
+#         # ----- error list extraction -----
+#         parsed_errors = parsed.get("errors") or parsed.get("error_list") or []
+#         if isinstance(parsed_errors, list) and parsed_errors:
+#             standardized["error_list"] = []
+#             for e in parsed_errors:
+#                 try:
+#                     standardized["error_list"].append({
+#                         "error_type": e.get("type", e.get("error_type", "general_error")),
+#                         "error_position": e.get("position", e.get("error_position", [0, 0])),
+#                         "incorrect_fragment": e.get("incorrect_fragment", ""),
+#                         "suggested_correction": e.get("correction", e.get("suggested_correction", "")),
+#                         "explanation": e.get("explanation", "")
+#                     })
+#                 except Exception as ex:
+#                     logger.warning("Skipping malformed error item: %s", ex)
+#         else:
+#             # kalau LLM gak ngasih error list, biarkan kosong aja
+#             standardized["error_list"] = []
+
+#         # ----- feedback extraction -----
+#         fb = parsed.get("feedback") or parsed.get("Feedback") or parsed.get("comments") or ""
+#         if not fb:
+#             gs = standardized["detailed_scores"]["grammar"]
+#             vs = standardized["detailed_scores"]["vocabulary"]
+#             cs = standardized["detailed_scores"]["coherence"]
+#             cas = standardized["detailed_scores"]["cultural_adaptation"]
+#             english_fb = f"Overall score: {standardized['overall_score']}. Grammar: {gs}/100; Vocabulary: {vs}/100; Coherence: {cs}/100. Focus on common Indonesian learner issues: word order and particles."
+#             ind_fb = "(Secara umum, perhatikan urutan kata dan penggunaan partikel.)"
+#             fb = f"{english_fb} {ind_fb}"
+#         if isinstance(fb, dict):
+#             e = fb.get("english") or fb.get("en") or ""
+#             i = fb.get("indonesian") or fb.get("id") or fb.get("indonesia") or ""
+#             if not e:
+#                 e = fb.get("text") or ""
+#             fb = f"{e} ({i})" if i else e
+#         else:
+#             fb = str(fb)
+
+#         standardized["feedback"] = fb
+
+#         # processing time was not measured because we didn't record start; add None or "0.00 detik"
+#         standardized["processing_time"] = parsed.get("processing_time") or "0.00 detik"
+
+#         # ----- final type sanitation -----
+#         try:
+#             standardized["overall_score"] = int(standardized["overall_score"])
+#         except Exception:
+#             standardized["overall_score"] = 0
+
+#         ds = standardized.get("detailed_scores", {})
+#         for k in ["grammar", "vocabulary", "coherence", "cultural_adaptation"]:
+#             try:
+#                 ds[k] = int(ds.get(k, 0))
+#             except Exception:
+#                 ds[k] = 0
+#         standardized["detailed_scores"] = ds
+
+#         if not isinstance(standardized.get("error_list"), list):
+#             standardized["error_list"] = []
+
+#         try:
+#             return json.dumps(standardized, ensure_ascii=False)
+#         except Exception as e:
+#             logger.exception("Failed to dump final standardized JSON.")
+#             return json.dumps({"error": f"Failed to build final JSON: {repr(e)}", "raw_parsed": parsed}, ensure_ascii=False)

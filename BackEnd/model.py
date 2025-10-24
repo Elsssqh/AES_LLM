@@ -1,498 +1,418 @@
+# -*- coding: utf-8 -*-
+# Pastikan encoding UTF-8 di awal
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
 import re
 import logging
-from typing import List, Tuple, Dict, Optional, Any
 import math
+from typing import List, Tuple, Dict, Optional, Any
+import time # Impor time
 import jieba
 import jieba.posseg as pseg
+import torch
 
 # ---------------- Logger ----------------
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
 # ---------------- Helpers ----------------
-def safe_json_load(s: str) -> Optional[Dict[str, Any]]:
-    """Attempt to load JSON robustly; try small cleanups if necessary."""
-    try:
-        return json.loads(s)
-    except Exception:
-        # remove trailing commas in objects/arrays
-        try:
-            s2 = re.sub(r',\s*([}\]])', r'\1', s)
-            return json.loads(s2)
-        except Exception:
-            return None
-
-def extract_json_block(text: str) -> Optional[str]:
-    """
-    Extract first balanced JSON object from text (scans braces).
-    Fallbacks to regex.
-    """
-    if not isinstance(text, str):
-        return None
-    text = text.strip()
-    start = None
-    depth = 0
-    for i, ch in enumerate(text):
-        if ch == '{':
-            if start is None:
-                start = i
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth == 0 and start is not None:
-                return text[start:i+1]
-    # fallback regex
-    m = re.search(r'\{(?:.|\s)*\}', text)
-    return m.group(0) if m else None
-
+# (Helper functions cosine_similarity, etc. tetap sama)
 def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    """Basic cosine similarity for two equal-dim vectors."""
-    if not v1 or not v2 or len(v1) != len(v2):
-        return 0.0
-    dot = sum(a*b for a,b in zip(v1, v2))
-    n1 = math.sqrt(sum(a*a for a in v1))
-    n2 = math.sqrt(sum(b*b for b in v2))
-    if n1 == 0 or n2 == 0:
-        return 0.0
+    if not v1 or not v2 or len(v1) != len(v2): return 0.0
+    dot = sum(a * b for a, b in zip(v1, v2))
+    n1 = math.sqrt(sum(a * a for a in v1))
+    n2 = math.sqrt(sum(b * b for b in v2))
+    if n1 == 0 or n2 == 0: return 0.0
     return dot / (n1 * n2)
 
-# ---------------- QwenScorer ----------------
+# ---------------- QwenScorer (Nama Kelas Sesuai Import) ----------------
+
 class QwenScorer:
     """
-    Wrapper for Qwen-1.8B-Chat to score HSK essays.
+    Implementasi Chain of Prompts (Rantai Prompt)
+    dengan instruksi prompt dalam Bahasa Mandarin.
     """
 
-    def __init__(self,
-                 model_name: str = "Qwen/Qwen-1_8B-Chat",
-                 use_embeddings_for_false_friends: bool = False,
-                 embedding_get_vec_fn: Optional[callable] = None):
-        """
-        model_name: HF model id (default Qwen/Qwen-1_8B-Chat)
-        use_embeddings_for_false_friends: enable embedding checks (optional)
-        embedding_get_vec_fn: function(word)->vector
-        """
-        logger.info("Initializing QwenScorer (model=%s)...", model_name)
+    def __init__(self, model_name: str = "Qwen/Qwen-1_8B-Chat"):
+        logger.info(f"Memulai inisialisasi QwenScorer dengan model: {model_name}")
         try:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Menggunakan device: {self.device}")
+            logging.getLogger("tensorflow").setLevel(logging.ERROR)
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            logger.info("Tokenizer loaded.")
+            logger.info("Tokenizer berhasil dimuat.")
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                trust_remote_code=True,
-                torch_dtype="auto"
+                model_name, device_map="auto", trust_remote_code=True, torch_dtype="auto"
             ).eval()
-            logger.info("Model loaded and set to eval mode.")
+            logger.info("Model Qwen-1.8B berhasil dimuat dan diatur ke mode eval.")
         except Exception as e:
-            logger.exception("Failed to load model/tokenizer.")
+            logger.exception(f"Gagal memuat model atau tokenizer {model_name}.")
             raise
-
-        # initialize jieba
         try:
+            jieba.setLogLevel(logging.INFO)
             jieba.initialize()
-        except Exception:
+            logger.info("Jieba berhasil diinisialisasi.")
+        except Exception as e:
+            logger.warning(f"Gagal inisialisasi Jieba sepenuhnya: {e}")
             pass
 
-        # flags / helpers for false friend detection
-        self.use_embeddings_for_false_friends = use_embeddings_for_false_friends
-        self.embedding_get_vec_fn = embedding_get_vec_fn
-
-        # rubric weights for computing overall if not provided
         self.rubric_weights = {
             "grammar": 0.30,
             "vocabulary": 0.30,
             "coherence": 0.20,
             "cultural_adaptation": 0.20
         }
+        logger.info(f"Rubric weights set (untuk output JSON): {self.rubric_weights}")
 
-        # small curated false-friend examples (expandable)
-        self.false_friend_examples = [
-            ("路忙", "路很拥挤"),
-            ("我妹妹是十岁", "我妹妹十岁"),
-        ]
-
-    # ---------------- Preprocess ----------------
     def _preprocess_with_jieba(self, essay: str) -> Tuple[str, str]:
-        """Run jieba segmentation and POS tagging; return (segmented, pos_lines)."""
+        # (Fungsi ini tidak berubah)
         try:
-            words = list(pseg.cut(essay))
-            segmented = " ".join([w for w, _ in words])
-            pos_lines = "\n".join([f"{w}: {flag}" for w, flag in words])
+            cleaned_essay = re.sub(r'\s+', '', essay).strip()
+            if not cleaned_essay:
+                 logger.warning("Input esai kosong setelah dibersihkan.")
+                 return "", ""
+            words_with_pos = list(pseg.cut(cleaned_essay))
+            segmented = " ".join([w for w, flag in words_with_pos if w.strip()])
+            pos_lines = "\n".join([f"{w}: {flag}" for w, flag in words_with_pos if w.strip()])
+            logger.debug(f"Jieba Segmented: {segmented}")
             return segmented, pos_lines
         except Exception as e:
-            logger.exception("Jieba preprocessing failed.")
-            return essay, "Jieba preprocessing failed."
+            logger.exception("Preprocessing Jieba gagal.")
+            return essay, "Jieba preprocessing gagal."
 
-    # ---------------- Prompt building (with few-shot & strict JSON) ----------------
-    def _build_prompt(self, essay: str, segmented: str, pos_tags: str, hsk_level: int) -> str:
+    # --- LANGKAH 1: PROMPT DETEKSI KESALAHAN (Versi Mandarin) ---
+    
+    def _build_error_detection_prompt(self, essay: str) -> str:
+        """Membangun prompt yang HANYA fokus mencari kesalahan (dalam B. Mandarin)."""
+        return f"""
+        您是一位经验丰富的中文语法专家，尤其擅长指导印尼学习者。
+        您的任务【仅仅】是找出下文中的语法、词汇或语序错误。
+
+        请【严格】遵守以下格式：
+        - 如果发现错误，请使用此格式： 错误类型 | 错误原文 | 修正建议 | 简短解释
+        - 每个错误占一行。
+        - 如果【没有发现任何错误】，请【只】回答 'TIDAK ADA KESALAHAN'。
+
+        --- 示例 ---
+        示例 1:
+        输入: 我妹妹是十岁。
+        输出: 助词误用(是) | 我妹妹是十岁 | 我妹妹十岁 | 表达年龄时通常不需要'是'。
+
+        示例 2:
+        输入: 我们住雅加达在。
+        输出: 语序干扰(SPOK) | 我们住雅加达在 | 我们住在雅加达 | 地点状语(在雅加达)应放在动词(住)之前。
+
+        示例 3:
+        输入: 路很忙。
+        输出: 词语误用(False Friend) | 路很忙 | 路很拥挤 | '忙'(máng)通常用于人，而非道路。
+
+        示例 4:
+        输入: 我喜欢学中文。
+        输出: TIDAK ADA KESALAHAN
+        --- 示例结束 ---
+
+        --- 主要任务 ---
+        请分析以下作文，找出所有错误。请严格遵守格式。
+
+        作文：
+        "{essay}"
         """
-        Build a carefully tuned prompt. Use placeholders replaced with .replace to avoid
-        .format brace collisions.
+
+    def _parse_errors_from_text(self, error_response: str, essay_text: str) -> List[Dict[str, Any]]:
         """
-
-        rubric_map = {
-            1: "HSK 1: very short texts; S-P or S-P-O basic structures.",
-            2: "HSK 2: 20–40 characters; use simple connectors like 在, 和.",
-            3: "HSK 3: 50–100 characters; use 的/得/地 and compound sentences."
-        }
-        rubric_desc = rubric_map.get(hsk_level, rubric_map[1])
-
-        # Few-shot examples to encourage consistent feedback and JSON fields.
-        # NOTE: use double-quoted JSON examples but don't use Python .format on them.
-        FEW_SHOT = r"""
-### Example 1
-Input: 我妹妹是十岁。
-Output JSON:
-{
-  "score": {"overall": 60, "grammar": 15, "vocabulary": 15, "coherence": 15, "cultural_adaptation": 15},
-  "errors": [
-    {
-      "type": "particle_misuse",
-      "position": [0, 6],
-      "incorrect_fragment": "我妹妹是十岁",
-      "correction": "我妹妹十岁",
-      "explanation": "Unnecessary '是' before age in Mandarin. (Partikel '是' tidak digunakan sebelum umur.)"
-    }
-  ],
-  "feedback": "Avoid using '是' before ages; try '我妹妹十岁'. (Hindari menggunakan '是' sebelum menyatakan umur.)"
-}
-
-### Example 2
-Input: 路很忙。
-Output JSON:
-{
-  "score": {"overall": 50, "grammar": 10, "vocabulary": 15, "coherence": 15, "cultural_adaptation": 10},
-  "errors": [
-    {
-      "type": "word_choice",
-      "position": [0, 3],
-      "incorrect_fragment": "路很忙",
-      "correction": "路很拥挤",
-      "explanation": "'忙' is not used to describe roads; use 拥挤. (Kata '忙' tidak tepat untuk jalan.)"
-    }
-  ],
-  "feedback": "Use appropriate collocations: '路很拥挤' instead of '路很忙'. (Gunakan kolokasi yang tepat.)"
-}
-"""
-
-        PROMPT = """
-You are an expert HSK writing examiner and Chinese-as-a-foreign-language teacher.
-Task: Evaluate the following Mandarin essay written by an Indonesian learner and return EXACTLY ONE VALID JSON OBJECT (no extra text).
-
-Important:
-- Return JSON only.
-- Include bilingual feedback (English sentence(s) followed by short Bahasa Indonesia in parentheses).
-- Use 0-based character indices for "position": [start_inclusive, end_exclusive].
-- Subscores grammar/vocabulary/coherence/cultural_adaptation should be 0–25 (integers).
-- overall should be 0–100 (integer).
-- If no errors of a given kind, return empty errors array [].
-
-FEW-SHOT EXAMPLES:
-<Few_Shot_Examples>
-
-ESSAY (ANALYZE ONLY THE TEXT BELOW):
-<ESSAY>
-
-JIEBA SEGMENTATION:
-<SEGMENTATION>
-
-POS TAGS:
-<POS_TAGS>
-
-RUBRIC NOTE:
-<RUBRIC>
-
-RETURN JSON IN THIS EXACT SHAPE (EXACT KEYS):
-{
-  "score": {
-    "overall": 0,
-    "grammar": 0,
-    "vocabulary": 0,
-    "coherence": 0,
-    "cultural_adaptation": 0
-  },
-  "errors": [
-    {
-      "type": "word_order",
-      "position": [0, 0],
-      "incorrect_fragment": "",
-      "correction": "",
-      "explanation": ""
-    }
-  ],
-  "feedback": ""  // must be a short paragraph: 3-6 sentences in English + short Bahasa Indonesia in parentheses
-}
-
-Now analyze the essay and return the JSON object exactly.
-"""
-        # assemble prompt by replacing placeholders (no {} for .format)
-        prompt = PROMPT.replace("<Few_Shot_Examples>", FEW_SHOT)\
-                       .replace("<ESSAY>", essay)\
-                       .replace("<SEGMENTATION>", segmented)\
-                       .replace("<POS_TAGS>", pos_tags)\
-                       .replace("<RUBRIC>", rubric_desc)
-        return prompt
-
-    # ---------------- False-friend helper ----------------
-    def detect_false_friends(self, token: str, context_tokens: List[str]) -> Tuple[bool, Optional[Tuple[str, float]]]:
+        Mem-parsing output teks dari _build_error_detection_prompt.
+        (Fungsi ini tidak berubah, karena 'TIDAK ADA KESALAHAN' dan '|' bersifat universal)
         """
-        Simple heuristic using curated list or embedding function if provided.
-        Returns (is_false_friend, (suggested_replacement, score))
-        """
-        for wrong, correct in self.false_friend_examples:
-            if wrong in token:
-                return True, (correct, 1.0)
-        if self.use_embeddings_for_false_friends and self.embedding_get_vec_fn:
-            try:
-                vec_t = self.embedding_get_vec_fn(token)
-                best = (None, -1.0)
-                for _, candidate in self.false_friend_examples:
-                    vec_c = self.embedding_get_vec_fn(candidate)
-                    sim = cosine_similarity(vec_t, vec_c)
-                    if sim > best[1]:
-                        best = (candidate, sim)
-                if best[0] and best[1] > 0.6:
-                    return True, (best[0], best[1])
-            except Exception:
-                return False, None
-        return False, None
-
-    def generate_json_from_llm_output(self, raw_output: str) -> Dict[str, Any]:
-        """Robustly parse LLM output into a Python dict.
-        Tries direct json.loads, cleaned substring, and regex/score extraction fallbacks.
-        """
-        if raw_output is None:
-            return {"error": "No output from LLM.", "raw_response": ""}
-        # 1) direct parse
-        try:
-            return json.loads(raw_output)
-        except Exception:
-            logger.warning("Initial JSON parse failed; trying cleanup.")
-        # 2) trim non-json prefix/suffix then parse
-        try:
-            cleaned = re.sub(r'^[^{\[]*', '', raw_output)
-            cleaned = re.sub(r'[^}\]]*$', '', cleaned)
-            return json.loads(cleaned)
-        except Exception:
-            logger.debug("Cleanup parse failed; trying regex/score extraction.")
-        # 3) fallback: try to extract key:value numeric pairs and return a minimal structure
-        try:
-            scores = re.findall(r'(\b[\w ]+\b):\s*(\d{1,3})', raw_output)
-            data = {
-                "overall_score": None,
-                "detailed_scores": {},
-                "error_list": [],
-                "feedback": raw_output.strip()
-            }
-            for k, v in scores:
-                key = k.lower().strip().replace(" ", "_")
+        validated_error_list = []
+        # Keyword 'TIDAK ADA KESALAHAN' sengaja tidak diterjemahkan agar unik
+        if "TIDAK ADA KESALAHAN" in error_response or error_response.strip() == "":
+            return []
+        
+        # Pola regex untuk menangkap 4 bagian yang dipisahkan oleh '|'
+        pattern = re.compile(r"(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+)")
+        
+        for line in error_response.split('\n'):
+            line = line.strip()
+            match = pattern.search(line)
+            
+            if match:
                 try:
-                    val = int(v)
-                except Exception:
-                    continue
-                if key in ("overall", "overall_score"):
-                    data["overall_score"] = val
-                else:
-                    data["detailed_scores"][key] = val
-            return data
-        except Exception:
-            logger.exception("All parsing fallbacks failed.")
-            return {"error": "Failed to parse JSON from LLM output.", "raw_response": str(raw_output)}
-
-
-    # ---------------- Main: generate_json ----------------
-    def generate_json(self, essay: str, hsk_level: int = 1) -> str:
-        """
-        Process essay -> build prompt -> call LLM -> parse & sanitize -> return standardized JSON.
-        Final standardized keys:
-          - text
-          - overall_score (int 0-100)
-          - detailed_scores: {grammar, vocabulary, coherence, cultural_adaptation} (ints 0-100)
-          - error_list: list of {error_type, error_position, incorrect_fragment, suggested_correction, explanation}
-          - feedback: bilingual string
-        """
-        logger.info("Generate JSON called (HSK %s) essay_length=%d", hsk_level, len(essay))
-        segmented, pos_tags = self._preprocess_with_jieba(essay)
-        logger.debug("Segmentation: %s", segmented)
-        prompt = self._build_prompt(essay, segmented, pos_tags, hsk_level)
-
-        # send to model
-        try:
-            logger.debug("Sending prompt to Qwen model (chat)...")
-            response, _ = self.model.chat(self.tokenizer, prompt, history=None)
-            logger.debug("Received response from model.")
-        except Exception as e:
-            logger.exception("LLM inference failed.")
-            return json.dumps({"error": f"LLM inference failed: {repr(e)}", "raw_prompt": prompt[:1000]}, ensure_ascii=False)
-
-        # sanitize response: remove code fences
-        resp = str(response).strip()
-        resp = re.sub(r'^\s*```(?:json)?\s*', '', resp)
-        resp = re.sub(r'\s*```\s*$', '', resp).strip()
-
-        # extract JSON block
-        json_block = extract_json_block(resp)
-        if json_block is None:
-            logger.warning("No JSON block found; will attempt full-response parsing.")
-            parsed = self.generate_json_from_llm_output(resp)
-        else:
-            parsed = safe_json_load(json_block)
-            if parsed is None:
-                # try more robust helper
-                parsed = self.generate_json_from_llm_output(json_block)
-
-        # Ensure parsed is a dict
-        if not isinstance(parsed, dict):
-            logger.error("Parsed LLM output is not a dict; returning error.")
-            return json.dumps({"error": "Parsed LLM output is not a dict.", "raw_response": resp}, ensure_ascii=False)
-
-        # start building standardized structure
-        standardized: Dict[str, Any] = {
-            "text": parsed.get("text", essay),
-            "overall_score": None,
-            "detailed_scores": {"grammar": 0, "vocabulary": 0, "coherence": 0, "cultural_adaptation": 0},
-            "error_list": [],
-            "feedback": parsed.get("feedback", ""),
-            "processing_time": None
-        }
-
-        # ----- scores normalization -----
-        score_block = parsed.get("score") or parsed.get("scores") or parsed.get("score_breakdown") or parsed.get("detailed_scores") or {}
-        try:
-            if isinstance(score_block, dict):
-                def parse_sub(k_list, default=0):
-                    for k in k_list:
-                        if k in score_block:
-                            try:
-                                return int(score_block[k])
-                            except Exception:
-                                try:
-                                    return int(float(score_block[k]))
-                                except Exception:
-                                    return default
-                    return default
-
-                g_raw = parse_sub(["grammar", "Grammar"], 0)
-                v_raw = parse_sub(["vocabulary", "Vocabulary"], 0)
-                c_raw = parse_sub(["coherence", "Coherence"], 0)
-                ca_raw = parse_sub(["cultural_adaptation", "cultural_adaptation", "Cultural Adaptation"], 0)
-
-                def normalize_sub(x):
-                    if x <= 25:
-                        return int(x * 4)
+                    err_type = match.group(1).strip()
+                    incorrect_frag = match.group(2).strip()
+                    correction = match.group(3).strip()
+                    explanation = match.group(4).strip()
+                    
+                    start_index = essay_text.find(incorrect_frag)
+                    if start_index != -1:
+                        end_index = start_index + len(incorrect_frag)
+                        pos = [start_index, end_index]
                     else:
-                        return max(0, min(100, int(x)))
+                        logger.warning(f"Tidak dapat menemukan posisi untuk fragmen: '{incorrect_frag}'. Menggunakan posisi default [0, 0].")
+                        pos = [0, 0]
 
-                grammar_s = normalize_sub(g_raw)
-                vocab_s = normalize_sub(v_raw)
-                coherence_s = normalize_sub(c_raw)
-                cultural_s = normalize_sub(ca_raw)
-
-                standardized["detailed_scores"] = {
-                    "grammar": grammar_s,
-                    "vocabulary": vocab_s,
-                    "coherence": coherence_s,
-                    "cultural_adaptation": cultural_s
-                }
-
-                # compute overall as rubric-weighted average unless explicit overall provided
-                overall_raw = None
-                # check multiple possible keys
-                if "overall" in score_block:
-                    overall_raw = score_block.get("overall")
-                elif "overall_score" in score_block:
-                    overall_raw = score_block.get("overall_score")
-
-                if overall_raw is not None:
-                    try:
-                        standardized["overall_score"] = int(overall_raw)
-                    except Exception:
-                        standardized["overall_score"] = None
-                else:
-                    # weighted compute
-                    calc = int(round(
-                        grammar_s * self.rubric_weights.get("grammar", 0.25) +
-                        vocab_s * self.rubric_weights.get("vocabulary", 0.25) +
-                        coherence_s * self.rubric_weights.get("coherence", 0.25) +
-                        cultural_s * self.rubric_weights.get("cultural_adaptation", 0.25)
-                    ))
-                    standardized["overall_score"] = max(0, min(100, calc))
-            else:
-                # maybe top-level overall present
-                o = parsed.get("overall") or parsed.get("overall_score") or parsed.get("Overall")
-                if o is not None:
-                    try:
-                        standardized["overall_score"] = int(o)
-                    except Exception:
-                        standardized["overall_score"] = 0
-        except Exception:
-            logger.exception("Error normalizing scores; setting defaults.")
-
-        # ----- error list extraction -----
-        parsed_errors = parsed.get("errors") or parsed.get("error_list") or []
-        if isinstance(parsed_errors, list) and parsed_errors:
-            standardized["error_list"] = []
-            for e in parsed_errors:
-                try:
-                    standardized["error_list"].append({
-                        "error_type": e.get("type", e.get("error_type", "general_error")),
-                        "error_position": e.get("position", e.get("error_position", [0, 0])),
-                        "incorrect_fragment": e.get("incorrect_fragment", ""),
-                        "suggested_correction": e.get("correction", e.get("suggested_correction", "")),
-                        "explanation": e.get("explanation", "")
+                    validated_error_list.append({
+                        "error_type": err_type,
+                        "error_position": pos,
+                        "incorrect_fragment": incorrect_frag,
+                        "suggested_correction": correction,
+                        "explanation": explanation
                     })
-                except Exception as ex:
-                    logger.warning("Skipping malformed error item: %s", ex)
-        else:
-            # kalau LLM gak ngasih error list, biarkan kosong aja
-            standardized["error_list"] = []
+                except Exception as e:
+                    logger.warning(f"Gagal mem-parsing baris error: '{line}'. Error: {e}")
+                    
+        return validated_error_list
 
-        # ----- feedback extraction -----
-        fb = parsed.get("feedback") or parsed.get("Feedback") or parsed.get("comments") or ""
-        if not fb:
-            gs = standardized["detailed_scores"]["grammar"]
-            vs = standardized["detailed_scores"]["vocabulary"]
-            cs = standardized["detailed_scores"]["coherence"]
-            cas = standardized["detailed_scores"]["cultural_adaptation"]
-            english_fb = f"Overall score: {standardized['overall_score']}. Grammar: {gs}/100; Vocabulary: {vs}/100; Coherence: {cs}/100. Focus on common Indonesian learner issues: word order and particles."
-            ind_fb = "(Secara umum, perhatikan urutan kata dan penggunaan partikel.)"
-            fb = f"{english_fb} {ind_fb}"
-        if isinstance(fb, dict):
-            e = fb.get("english") or fb.get("en") or ""
-            i = fb.get("indonesian") or fb.get("id") or fb.get("indonesia") or ""
-            if not e:
-                e = fb.get("text") or ""
-            fb = f"{e} ({i})" if i else e
-        else:
-            fb = str(fb)
+    # --- LANGKAH 2: PROMPT PENILAIAN (Versi Mandarin) ---
 
-        standardized["feedback"] = fb
+    def _build_scoring_prompt(self, essay: str, hsk_level: int, detected_errors: List[Dict]) -> str:
+        """
+        Membangun prompt yang HANYA fokus memberi skor (dalam B. Mandarin).
+        VERSI DIPERKETAT v3: Menghapus SEMUA distraksi (termasuk error_summary).
+        """
+        
+        # KITA HAPUS error_summary. Ternyata ini mengganggu model kecil.
+        # error_summary = "未检测到语法错误。"
+        # if detected_errors:
+        #     error_summary = f"检测到 {len(detected_errors)} 个错误。" 
+        
+        return f"""
+您是HSK作文评分员。
+您的任务【仅仅】是提供分数（0-100）。
+【不要】写任何评语或解释。
 
-        # processing time was not measured because we didn't record start; add None or "0.00 detik"
-        standardized["processing_time"] = parsed.get("processing_time") or "0.00 detik"
+HSK等级: {hsk_level}
+作文: "{essay}"
 
-        # ----- final type sanitation -----
+请【必须】按照以下纯文本格式提供所有5个分数。
+【不要】写任何其他文字。
+
+语法准确性: [分数]
+词汇水平: [分数]
+篇章连贯: [分数]
+任务完成度: [分数]
+总体得分: [分数]
+"""
+
+    def _extract_scores_from_text(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Mengekstrak skor dari output teks.
+        (Fungsi ini tidak berubah, sudah mendukung keyword Mandarin)
+        """
         try:
-            standardized["overall_score"] = int(standardized["overall_score"])
-        except Exception:
-            standardized["overall_score"] = 0
+            extracted_data = {"score": {}}
+            found_any_score = False
+            patterns = {
+                # Regex sudah mencakup keyword Mandarin (语法准确性) dan Inggris (grammar)
+                "grammar": r"(?:语法准确性|grammar)\s*[:：分]?\s*(\d{1,3})",
+                "vocabulary": r"(?:词汇水平|vocabulary)\s*[:：分]?\s*(\d{1,3})",
+                "coherence": r"(?:篇章连贯|连贯性|coherence)\s*[:：分]?\s*(\d{1,3})",
+                "task_fulfillment": r"(?:任务完成度|task_fulfillment|cultural_adaptation)\s*[:：分]?\s*(\d{1,3})",
+                "overall": r"(?:总体得分|总分|overall)\s*[:：分]?\s*(\d{1,3})"
+            }
 
-        ds = standardized.get("detailed_scores", {})
-        for k in ["grammar", "vocabulary", "coherence", "cultural_adaptation"]:
-            try:
-                ds[k] = int(ds.get(k, 0))
-            except Exception:
-                ds[k] = 0
-        standardized["detailed_scores"] = ds
+            for key, pattern in patterns.items():
+                match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+                if match:
+                    score_val = int(match.group(1))
+                    score_clamped = max(0, min(100, score_val))
+                    extracted_data["score"][key] = score_clamped
+                    found_any_score = True
+                    logger.debug(f"Parser Skor: Ditemukan skor {key}={score_clamped}")
 
-        if not isinstance(standardized.get("error_list"), list):
-            standardized["error_list"] = []
-
-        try:
-            return json.dumps(standardized, ensure_ascii=False)
+            if not found_any_score:
+                 logger.warning("Parser Skor: Tidak ada skor yang dapat diekstrak dari teks.")
+                 return None
+            
+            extracted_data["feedback"] = ""
+            extracted_data["errors"] = []
+            
+            return extracted_data
+        
         except Exception as e:
-            logger.exception("Failed to dump final standardized JSON.")
-            return json.dumps({"error": f"Failed to build final JSON: {repr(e)}", "raw_parsed": parsed}, ensure_ascii=False)
+            logger.error(f"Parser Skor: Ekstraksi skor dari teks gagal total: {e}")
+            return None
 
+    # --- LANGKAH 3: PROMPT UMPAN BALIK (Versi Mandarin) ---
+    
+    def _build_feedback_prompt(self, essay: str, scores: Dict, errors: List[Dict]) -> str:
+        """Membangun prompt yang HANYA menghasilkan feedback kualitatif (dalam B. Mandarin)."""
+        
+        # Gunakan key bahasa Inggris (grammar, vocab, dll) karena itu yang disimpan
+        # oleh _extract_scores_from_text
+        score_summary = (
+            f"总体得分: {scores.get('overall', 'N/A')}, "
+            f"语法: {scores.get('grammar', 'N/A')}, "
+            f"词汇: {scores.get('vocabulary', 'N/A')}"
+        )
+        
+        error_summary = "未发现主要错误。"
+        if errors:
+            error_summary = "发现的主要错误:\n"
+            for err in errors[:2]: # Tampilkan maks 2 kesalahan
+                error_summary += f"- {err.get('explanation', 'N/A')}\n"
+
+        return f"""
+您是一位友好且善于鼓励的中文老师。
+您的任务是根据学生的作文、得分和错误，写一段简短的评语（2-3句话）。
+请用中文书写评语，并在括号()中附上简短的印尼语翻译。
+
+学生作文:
+"{essay}"
+
+所得分数:
+{score_summary}
+
+错误备注:
+{error_summary}
+
+请现在撰写您的评语：
+"""
+
+    # --- FUNGSI UTAMA: GENERATE_JSON ---
+
+    def generate_json(self, essay: str, hsk_level: int = 3) -> str:
+        """
+        Fungsi utama untuk menilai esai menggunakan arsitektur Chain of Prompts.
+        (Logika fungsi ini tidak berubah, hanya memanggil prompt baru)
+        """
+        start_time = time.time()
+        logger.info(f"Menerima permintaan penilaian (generate_json) untuk esai HSK {hsk_level} (panjang: {len(essay)} karakter).")
+
+        if not essay or not essay.strip():
+            logger.warning("Input esai kosong atau hanya berisi spasi.")
+            error_result = {"error": "Input esai kosong.", "essay": essay}
+            duration = time.time() - start_time
+            error_result["processing_time"] = f"{duration:.2f} detik"
+            return json.dumps(error_result, ensure_ascii=False, indent=2)
+
+        # --- LANGKAH 1: DETEKSI KESALAHAN ---
+        logger.info("Memulai Langkah 1: Mendeteksi Kesalahan...")
+        validated_error_list = []
+        try:
+            error_prompt = self._build_error_detection_prompt(essay)
+            error_response, _ = self.model.chat(self.tokenizer, error_prompt, history=None)
+            logger.debug(f"Langkah 1 (Raw Response): {error_response}")
+            validated_error_list = self._parse_errors_from_text(error_response, essay)
+            logger.info(f"Langkah 1 Selesai. Ditemukan {len(validated_error_list)} kesalahan.")
+        except Exception as e:
+            logger.exception("Langkah 1 (Deteksi Kesalahan) Gagal.")
+            validated_error_list = []
+
+        # --- LANGKAH 2: PENILAIAN ---
+        logger.info("Memulai Langkah 2: Memberikan Skor...")
+        parsed_scores = {}
+        grammar_s, vocab_s, coherence_s, cultural_s, overall_s = 0, 0, 0, 0, 0
+        try:
+            scoring_prompt = self._build_scoring_prompt(essay, hsk_level, validated_error_list)
+            scoring_response, _ = self.model.chat(self.tokenizer, scoring_prompt, history=None)
+            logger.debug(f"Langkah 2 (Raw Response): {scoring_response}")
+            
+            parsed_scores_data = self._extract_scores_from_text(scoring_response)
+            if not parsed_scores_data or "score" not in parsed_scores_data:
+                logger.error("Langkah 2 Gagal: Tidak dapat mem-parsing skor dari model.")
+                raise ValueError("Gagal mem-parsing skor.")
+                
+            parsed_scores = parsed_scores_data.get("score", {})
+            
+            grammar_s = parsed_scores.get("grammar", 0)
+            vocab_s = parsed_scores.get("vocabulary", 0)
+            coherence_s = parsed_scores.get("coherence", 0)
+            cultural_s = parsed_scores.get("task_fulfillment", 0)
+            overall_s = parsed_scores.get("overall", 0)
+
+            if overall_s == 0 and (grammar_s > 0 or vocab_s > 0):
+                logger.info("Skor 'overall' tidak ada/0. Menghitung berdasarkan bobot rubrik...")
+                calc_score = (grammar_s * self.rubric_weights["grammar"]) + \
+                             (vocab_s * self.rubric_weights["vocabulary"]) + \
+                             (coherence_s * self.rubric_weights["coherence"]) + \
+                             (cultural_s * self.rubric_weights["cultural_adaptation"])
+                overall_s = max(0, min(100, int(round(calc_score))))
+
+            logger.info(f"Langkah 2 Selesai. Skor diterima (Overall: {overall_s}).")
+
+        except Exception as e:
+            logger.exception("Langkah 2 (Penilaian) Gagal Total.")
+            parsed_scores = {"grammar": 0, "vocabulary": 0, "coherence": 0, "task_fulfillment": 0, "overall": 0}
+
+
+        # --- LANGKAH 3: UMPAN BALIK ---
+        logger.info("Memulai Langkah 3: Menghasilkan Feedback...")
+        feedback = "Gagal menghasilkan feedback."
+        try:
+            # `parsed_scores` menggunakan key B. Inggris (grammar, vocab), ini sesuai
+            feedback_prompt = self._build_feedback_prompt(essay, parsed_scores, validated_error_list)
+            feedback_response, _ = self.model.chat(self.tokenizer, feedback_prompt, history=None)
+            feedback = feedback_response.strip()
+            
+            if not feedback:
+                if not validated_error_list and overall_s > 80:
+                    feedback = "作文写得很好，未发现明显错误。继续努力！(Esai ditulis dengan baik, tidak ditemukan kesalahan signifikan. Teruslah berusaha!)"
+                elif validated_error_list:
+                     feedback = "作文中发现一些错误，请查看错误列表了解详情。(Ditemukan beberapa kesalahan dalam esai, silakan periksa daftar kesalahan untuk detailnya.)"
+                else:
+                    feedback = "请重新检查你的作文。(Harap periksa kembali esai Anda.)"
+            
+            logger.info("Langkah 3 Selesai.")
+        except Exception as e:
+            logger.exception("Langkah 3 (Feedback) Gagal.")
+            if validated_error_list:
+                feedback = "作文中发现一些错误，请查看错误列表了解详情。(Ditemukan beberapa kesalahan dalam esai, silakan periksa daftar kesalahan untuk detailnya.)"
+            elif overall_s > 80:
+                feedback = "作文写得很好，未发现明显错误。继续努力！(Esai ditulis dengan baik, tidak ditemukan kesalahan signifikan. Teruslah berusaha!)"
+
+
+        # --- FINAL: PERAKITAN JSON ---
+        final_result = {
+            "text": essay,
+            "overall_score": overall_s,
+            "detailed_scores": {
+                "grammar": grammar_s,
+                "vocabulary": vocab_s,
+                "coherence": coherence_s,
+                "cultural_adaptation": cultural_s 
+            },
+            "error_list": validated_error_list,
+            "feedback": feedback
+        }
+
+        end_time = time.time()
+        duration = end_time - start_time
+        final_result["processing_time"] = f"{duration:.2f} detik"
+        logger.info(f"Semua langkah selesai. Waktu pemrosesan: {duration:.2f} detik")
+
+        return json.dumps(final_result, ensure_ascii=False, indent=2)
+
+
+# ---------------- Simulasi (Main execution) ----------------
+if __name__ == "__main__":
+    logger.setLevel(logging.INFO)
+    try:
+        scorer = QwenScorer()
+
+        logger.info("="*50 + "\nMENJALANKAN SIMULASI 1: Esai Lampiran 2 (Esai Bagus)\n" + "="*50)
+        essay_lampiran_2 = "上个星期六，我和朋友去公园玩。我们早上九点起床。我吃早饭，然后穿衣服。朋友开车带我们去公园。公园里有很多人。我们放风筝，吃午饭，然后回家。我玩得很开心。"
+        result_json_1 = scorer.generate_json(essay_lampiran_2, hsk_level=2)
+        print("\n--- HASIL SIMULASI 1 (JSON) ---")
+        print(result_json_1)
+        print("---------------------------------\n")
+
+        logger.info("="*50 + "\nMENJALANKAN SIMULASI 2: Esai dengan Kesalahan Khas\n" + "="*50)
+        essay_errors = "我妹妹是十岁。我们住雅加达在。今天路很忙。"
+        result_json_2 = scorer.generate_json(essay_errors, hsk_level=3)
+        print("\n--- HASIL SIMULASI 2 (JSON) ---")
+        print(result_json_2)
+        print("---------------------------------\n")
+
+        logger.info("="*50 + "\nMENJALANKAN SIMULASI 3: Esai Pendek Bagus\n" + "="*50)
+        essay_short_good = "我喜欢学中文。"
+        result_json_3 = scorer.generate_json(essay_short_good, hsk_level=1)
+        print("\n--- HASIL SIMULASI 3 (JSON) ---")
+        print(result_json_3)
+        print("---------------------------------\n")
+
+        logger.info("Semua simulasi selesai.")
+    except Exception as e:
+        logger.critical(f"Gagal menjalankan program utama: {e}", exc_info=True)
+        logger.critical("Pastikan koneksi internet, 'transformers', 'torch', 'jieba' terinstal.")
