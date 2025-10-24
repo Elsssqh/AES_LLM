@@ -430,63 +430,24 @@ Now analyze the essay and return the JSON object exactly.
         except Exception:
             logger.exception("Error normalizing scores; setting defaults.")
 
-        # ----- errors extraction & strict validation -----
-        errors_block = parsed.get("errors") or parsed.get("error_list") or parsed.get("Error List") or []
-        validated_errors: List[Dict[str, Any]] = []
-        if isinstance(errors_block, list):
-            for idx, item in enumerate(errors_block):
-                if not isinstance(item, dict):
-                    logger.warning("Skipping non-dict error item at index %d", idx)
-                    continue
-                etype = item.get("type") or item.get("error_type") or item.get("errorType") or "unknown"
-                pos = item.get("position") or item.get("error_position") or item.get("pos") or []
-                incorrect_fragment = item.get("incorrect_fragment") or item.get("incorrect") or item.get("incorrect_fragment", "")
-                correction = item.get("correction") or item.get("suggested_correction") or item.get("correction", "")
-                explanation = item.get("explanation") or item.get("explain") or item.get("explanation", "")
-
-                if not isinstance(pos, list) or len(pos) != 2:
-                    logger.warning("Invalid position for error idx %s: %s", idx, pos)
-                    continue
-                start_pos, end_pos = pos
-                if not (isinstance(start_pos, int) and isinstance(end_pos, int)):
-                    logger.warning("Non-int positions for error idx %s: %s", idx, pos)
-                    continue
-                if start_pos < 0 or end_pos > len(essay) or start_pos >= end_pos:
-                    logger.warning("Out-of-bound positions for error idx %s: %s (essay_len=%d)", idx, pos, len(essay))
-                    continue
-                actual = essay[start_pos:end_pos]
-                if incorrect_fragment and actual != incorrect_fragment:
-                    logger.warning("Mismatch fragment for error idx %s: claimed '%s' vs actual '%s' - skipping", idx, incorrect_fragment, actual)
-                    continue
-
-                validated_errors.append({
-                    "error_type": etype,
-                    "error_position": [start_pos, end_pos],
-                    "incorrect_fragment": actual,
-                    "suggested_correction": correction,
-                    "explanation": explanation
-                })
-        else:
-            logger.warning("Parsed errors block is not a list; ignoring.")
-
-        standardized["error_list"] = validated_errors
-
-        # if no errors but overall < 100, add conservative potential_error items
-        if not standardized["error_list"] and isinstance(standardized.get("overall_score"), int) and standardized["overall_score"] < 100:
-            try:
-                words = list(pseg.cut(essay))
-                pe = []
-                for i, w in enumerate(words[:3]):
-                    pe.append({
-                        "error_type": "potential_error",
-                        "error_position": [i, i+1],
-                        "incorrect_fragment": w.word,
-                        "suggested_correction": w.word,
-                        "explanation": "Potential issue detected automatically; please verify."
+        # ----- error list extraction -----
+        parsed_errors = parsed.get("errors") or parsed.get("error_list") or []
+        if isinstance(parsed_errors, list) and parsed_errors:
+            standardized["error_list"] = []
+            for e in parsed_errors:
+                try:
+                    standardized["error_list"].append({
+                        "error_type": e.get("type", e.get("error_type", "general_error")),
+                        "error_position": e.get("position", e.get("error_position", [0, 0])),
+                        "incorrect_fragment": e.get("incorrect_fragment", ""),
+                        "suggested_correction": e.get("correction", e.get("suggested_correction", "")),
+                        "explanation": e.get("explanation", "")
                     })
-                standardized["error_list"] = pe
-            except Exception:
-                logger.debug("Failed to generate potential_error fallback.")
+                except Exception as ex:
+                    logger.warning("Skipping malformed error item: %s", ex)
+        else:
+            # kalau LLM gak ngasih error list, biarkan kosong aja
+            standardized["error_list"] = []
 
         # ----- feedback extraction -----
         fb = parsed.get("feedback") or parsed.get("Feedback") or parsed.get("comments") or ""
